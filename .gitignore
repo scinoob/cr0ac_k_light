@@ -1,0 +1,23 @@
+# ignore folders
+.vscode/
+.idea/
+
+ch64spaAtt/
+
+checkpoints/
+only_mam_quard/
+only_vit/
+output_train/
+test_results/
+test_results_benchmark/
+wdecay001spaAtt/
+
+log/
+
+# ignore pycache
+__pycache__
+
+
+# ignore files
+*.pth
+*.md
