@@ -163,7 +163,7 @@ class CFDDataset(BaseCrackDataset):
     """
 
     def _load_data(self):
-        if self.split in ['val','validation']:
+        if self.split in ['val', 'validation']:
             split_dir = 'validation'
         else:
             split_dir = self.split
@@ -355,6 +355,8 @@ def get_transforms(
     if mode == 'train':
         transform = A.Compose([
             A.Resize(target_size, target_size, interpolation=cv2.INTER_CUBIC),
+            # 增强对比度，凸显细微裂缝
+            A.CLAHE(clip_limit=4., tile_grid_size=(8, 8), p=0.8),
             A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.5),
@@ -374,6 +376,8 @@ def get_transforms(
     else:
         transform = A.Compose([
             A.Resize(target_size, target_size, interpolation=cv2.INTER_CUBIC),
+            # 测试和验证集必须以 p=1.0 概率做同样的对比度增强
+            A.CLAHE(clip_limit=4., tile_grid_size=(8, 8), p=1.),
             A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
             # A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
             ToTensorV2(),

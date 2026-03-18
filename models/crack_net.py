@@ -13,6 +13,38 @@ from modules.base_modules import DepthwiseSeparableConv, PConv, PConvBlock, UpSa
 from modules.dual_branch import DualBranchModuleA
 
 
+class AttentionGate(nn.Module):
+    """
+    注意力门控机制 (Attention Gate)
+    利用深层特征 (g) 生成空间权重，过滤浅层特征 (x) 中的背景噪声。
+    """
+
+    def __init__(self, F_g, F_l, F_int):
+        super(AttentionGate, self).__init__()
+        self.W_g = nn.Sequential(
+            nn.Conv2d(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+        self.W_x = nn.Sequential(
+            nn.Conv2d(F_l, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+        self.psi = nn.Sequential(
+            nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid()
+        )
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, g, x):
+        # g: 深层上采样特征; x: 浅层跳跃连接特征
+        g1 = self.W_g(g)
+        x1 = self.W_x(x)
+        psi = self.relu(g1 + x1)
+        psi = self.psi(psi)
+        return x * psi
+
+
 class LightFusionBlock(nn.Module):
     """
     轻量融合块
@@ -658,6 +690,25 @@ class CrackSegmentationNet(nn.Module):
 # --- 在 models/crack_net.py 中添加 ---
 from modules.SS2D_quard_parallel import AGM_Module  # 确保导入新定义的 AGM
 
+class MaxPoolDown(nn.Module):
+    """
+    基于最大池化的下采样模块
+    利用 MaxPool 保留区域内的最大激活值（微弱裂缝的峰值特征），
+    防止微小目标在跨步卷积（stride=2）中被背景平滑掉导致特征消失。
+    """
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        # 1. 使用 MaxPool 进行严格的空间下采样，保留最强信号
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        # 2. 池化后接 3x3 卷积，用于调整通道数并进行局部上下文特征重组
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.conv(self.pool(x))
 
 class AGM_LightFusion(nn.Module):
     """
@@ -665,8 +716,12 @@ class AGM_LightFusion(nn.Module):
     替代原有的 LightFusionBlock，专注于低参数量的跳跃连接合并。
     """
 
-    def __init__(self, in_channels, out_channels, use_gbc: bool = True):
+    def __init__(self, up_channels, skip_channels, out_channels, use_gbc: bool = True):
         super().__init__()
+        # 引入注意力门控，中间通道数设为浅层通道数的一半，极大地控制参数量
+        self.ag = AttentionGate(F_g=up_channels, F_l=skip_channels, F_int=skip_channels // 2)
+
+        in_channels = skip_channels + up_channels
 
         self.reduce = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 1, bias=False),
@@ -678,8 +733,14 @@ class AGM_LightFusion(nn.Module):
         self.refine = GBC(out_channels) if use_gbc else PConvBlock(out_channels)
 
     def forward(self, x_up, x_skip):
+        # 1. 用深层特征 x_up 过滤浅层特征 x_skip
+        x_skip_ag = self.ag(g=x_up, x=x_skip)
         # return self.fuse(torch.cat([x_up, x_skip], dim=1))
-        x = torch.cat([x_up, x_skip], dim=1)
+
+        # 2. 拼接过滤后的特征与深沉特征
+        x = torch.cat([x_up, x_skip_ag], dim=1)
+
+        # 3. 降维并细化
         x = self.reduce(x)
         return self.refine(x)
 
@@ -712,11 +773,14 @@ class CrackSegmentationNetV2(nn.Module):
         # 在高分辨率下，GBC 能有效剥离水渍和阴影，为主干减负
         self.stage1_gbc = GBC(chs[0]) if use_gbc else nn.Identity()
         self.stage1 = PConvBlock(chs[0], drop_path_rate=dpr[0])
-        self.down1 = DepthwiseSeparableConv(chs[0], chs[1], stride=2)
+        # self.down1 = DepthwiseSeparableConv(chs[0], chs[1], stride=2)
+        # 替换为池化提取特征
+        self.down1 = MaxPoolDown(chs[0], chs[1])
 
         self.stage2_gbc = GBC(chs[1]) if use_gbc else nn.Identity()
         self.stage2 = PConvBlock(chs[1], drop_path_rate=dpr[1])
-        self.down2 = DepthwiseSeparableConv(chs[1], chs[2], stride=2)
+        # self.down2 = DepthwiseSeparableConv(chs[1], chs[2], stride=2)
+        self.down2 = MaxPoolDown(chs[1], chs[2])
 
         # 深层保持 AGM Mamba，提取拓扑连通性
         self.stage3 = AGM_Module(chs[2], drop_path_rate=dpr[2])
@@ -724,12 +788,21 @@ class CrackSegmentationNetV2(nn.Module):
         self.stage4 = AGM_Module(chs[3], drop_path_rate=dpr[3])
 
         # 解码器：传入 use_gbc 进行高保真重建
+        # self.up4 = UpSample(2)
+        # self.fuse3 = AGM_LightFusion(chs[3] + chs[2], chs[2], use_gbc)
+        # self.up3 = UpSample(2)
+        # self.fuse2 = AGM_LightFusion(chs[2] + chs[1], chs[1], use_gbc)
+        # self.up2 = UpSample(2)
+        # self.fuse1 = AGM_LightFusion(chs[1] + chs[0], chs[0], use_gbc)
+        # self.up1 = UpSample(2)
+
+        # 解码器：传入 use_gbc 进行高保真重建 (修改为分别传入 up_channels 和 skip_channels)
         self.up4 = UpSample(2)
-        self.fuse3 = AGM_LightFusion(chs[3] + chs[2], chs[2], use_gbc)
+        self.fuse3 = AGM_LightFusion(up_channels=chs[3], skip_channels=chs[2], out_channels=chs[2], use_gbc=use_gbc)
         self.up3 = UpSample(2)
-        self.fuse2 = AGM_LightFusion(chs[2] + chs[1], chs[1], use_gbc)
+        self.fuse2 = AGM_LightFusion(up_channels=chs[2], skip_channels=chs[1], out_channels=chs[1], use_gbc=use_gbc)
         self.up2 = UpSample(2)
-        self.fuse1 = AGM_LightFusion(chs[1] + chs[0], chs[0], use_gbc)
+        self.fuse1 = AGM_LightFusion(up_channels=chs[1], skip_channels=chs[0], out_channels=chs[0], use_gbc=use_gbc)
         self.up1 = UpSample(2)
 
         self.seg_head = nn.Sequential(

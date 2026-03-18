@@ -17,6 +17,7 @@ import numpy as np
 import cv2
 import time
 import json
+from datetime import datetime
 
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -494,8 +495,6 @@ class Trainer:
             save_dir: str
     ):
         """保存测试结果到文件"""
-        import json
-        from datetime import datetime
 
         # 保存指标
         metrics_path = os.path.join(save_dir, 'test_metrics.json')
@@ -760,7 +759,7 @@ def get_args():
                         help='数据集名称')
     parser.add_argument('--data_root', type=str, default='/mnt/d/dev/data/CFD',
                         help='数据根目录')
-    parser.add_argument('--input_size', type=int, default=256,
+    parser.add_argument('--input_size', type=int, default=224,
                         help='输入图像尺寸')
     parser.add_argument('--batch_size', type=int, default=16,
                         help='批次大小')
@@ -846,8 +845,7 @@ def main():
     # 原代码直接使用 args.save_dir，现在改为: output_train/数据集名称_年_月_日
     # 理由: 便于组织和管理不同数据集、不同日期的训练结果
     if args.save_dir == './checkpoints':
-        from datetime import datetime
-        current_date = datetime.now().strftime('%Y_%m_%d')
+        current_date = datetime.now().strftime('%Y_%m_%d_%H_%M')
         args.save_dir = f'output_train/{args.dataset}_{current_date}'
         print(f"训练结果保存路径: {args.save_dir}")
 

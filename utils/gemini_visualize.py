@@ -60,6 +60,9 @@ def plot_all_layers_cam(image_tensor, cams_dict, pred_mask, save_path):
     # 3. 绘制各层特征热力图
     plot_idx = 2
     for layer_name, cam in cams_dict.items():
+        # 将 PyTorch Tensor 转换为 NumPy 数组，并去掉 batch 和 channel 维度 (B, 1, H, W -> H, W)
+        if isinstance(cam, torch.Tensor):
+            cam = cam.detach().cpu().squeeze().numpy()
         # CAM 缩放到原图大小
         cam_resized = cv2.resize(cam, (img_show.shape[1], img_show.shape[0]))
         
