@@ -755,20 +755,20 @@ def get_args():
     parser = argparse.ArgumentParser(description='裂缝分割网络训练')
 
     # 数据参数
-    parser.add_argument('--dataset', type=str, default='crack500',
+    parser.add_argument('--dataset', type=str, default='cfd',
                         choices=['crack500', 'cfd', 'sun520'],
                         help='数据集名称')
-    parser.add_argument('--data_root', type=str, default='/mnt/d/dev/data/crack500',
+    parser.add_argument('--data_root', type=str, default='/mnt/d/dev/data/CFD',
                         help='数据根目录')
     parser.add_argument('--input_size', type=int, default=256,
                         help='输入图像尺寸')
     parser.add_argument('--batch_size', type=int, default=16,
                         help='批次大小')
-    parser.add_argument('--num_workers', type=int, default=1,
+    parser.add_argument('--num_workers', type=int, default=0,
                         help='数据加载工作进程数')
 
     # 模型参数
-    parser.add_argument('--base_channels', type=int, default=32,
+    parser.add_argument('--base_channels', type=int, default=96,
                         help='基础通道数')
     parser.add_argument('--d_state', type=int, default=16,
                         help='Mamba状态维度')
@@ -794,7 +794,7 @@ def get_args():
                         help='预热轮数')
     parser.add_argument('--use_amp', action='store_true',
                         help='使用混合精度训练')
-    parser.add_argument('--grad_clip', type=float, default=1.0,
+    parser.add_argument('--grad_clip', type=float, default=2.0,
                         help='梯度裁剪阈值')
 
     # 损失函数参数

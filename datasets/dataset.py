@@ -163,7 +163,10 @@ class CFDDataset(BaseCrackDataset):
     """
 
     def _load_data(self):
-        split_dir = self.split
+        if self.split in ['val','validation']:
+            split_dir = 'validation'
+        else:
+            split_dir = self.split
 
         image_dir = os.path.join(self.root_dir, split_dir, 'image')
         mask_dir = os.path.join(self.root_dir, split_dir, 'groundtruth')
@@ -184,9 +187,9 @@ class CFDDataset(BaseCrackDataset):
             base_name = os.path.splitext(img_file)[0]
             if '_label' in base_name:
                 # validation数据集的特殊命名
-                mask_name = base_name.replace('_label', '') + '.png'
+                mask_name = base_name.replace('_label', '') + '.PNG'
             else:
-                mask_name = base_name + '_label.png'
+                mask_name = base_name + '_label.PNG'
 
             mask_path = os.path.join(mask_dir, mask_name)
 
