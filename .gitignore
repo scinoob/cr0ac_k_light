@@ -11,6 +11,8 @@ output_train/
 test_results/
 test_results_benchmark/
 wdecay001spaAtt/
+gradcam_outputs/
+test_results_gemini0314/
 
 log/
 

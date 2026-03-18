@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn as nn
 from einops import repeat
-from timm.layers import trunc_normal_
+from timm.layers import trunc_normal_, DropPath
 from modules import BottConv
 
 MAMBA_AVAILABLE = False
@@ -461,6 +461,105 @@ class SS2D_QuadParallel(nn.Module):
         out = y_mamba.transpose(-1, -2).reshape(B, self.output_dim, *img_dims)
 
         return out
+
+
+# edited by gemini
+# --- 追加到 SS2D_quard_parallel.py 末尾 ---
+
+class AnisotropicGatedSASS(SS2D_SASS_Quarter):
+    """
+    [新增模块] 各向异性门控 SASS
+    继承自 SS2D_SASS_Quarter，通过可学习的 gamma 参数动态调节四个扫描方向的贡献度。
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # 初始化 4 个扫描方向的权重，默认相等
+        self.gamma = nn.Parameter(torch.ones(4))
+        # 用于调控gamma系数
+        self.scale = 2.0
+
+    def forward(self, x):
+        if x.dtype == torch.float16:
+            x = x.type(torch.float32)
+
+        batch_size, _, H, W = x.shape
+        L = H * W
+        hw_shape = (H, W)
+        E = self.d_inner
+
+        x = x.flatten(2).transpose(1, 2)
+        xz = self.in_proj(x)
+        A = -torch.exp(self.A_log.float())
+        x, z = xz.chunk(2, dim=-1)
+
+        x_2d = x.reshape(batch_size, H, W, E).permute(0, 3, 1, 2)
+        x_2d = self.act(self.conv2d(x_2d))
+        x_conv = x_2d.permute(0, 2, 3, 1).reshape(batch_size, L, E)
+
+        x_dbl = self.x_proj(x_conv)
+        dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        dt = self.dt_proj(dt).permute(0, 2, 1).contiguous()
+        B = B.permute(0, 2, 1).contiguous()
+        C = C.permute(0, 2, 1).contiguous()
+
+        orders, inverse_orders, directions = self.sass(hw_shape)
+        direction_Bs = [self.direction_Bs[d, :] for d in directions]
+        direction_Bs = [dB[None, :, :].expand(batch_size, -1, -1).permute(0, 2, 1).to(dtype=B.dtype) for dB in
+                        direction_Bs]
+
+        # 计算归一化的各向异性权重
+        # weights = torch.softmax(self.gamma, dim=0)
+        # 【关键手术 1】将 Softmax 替换为 Sigmoid
+        # 理由：允许裂缝在多个方向同时拥有高权重，乘以 2.0 保持均值域稳定
+        weights = torch.sigmoid(self.gamma) * self.scale
+
+        y_scan = []
+        for i, (o, inv_order, dB) in enumerate(zip(orders, inverse_orders, direction_Bs)):
+            # 执行选择性扫描
+            y_d = selective_scan_fn(
+                x_conv[:, o, :].permute(0, 2, 1).contiguous(),
+                dt, A, (B + dB).contiguous(), C, self.D,
+                z=None, delta_bias=self.dt_proj.bias, delta_softplus=True
+            ).permute(0, 2, 1)[:, inv_order, :]
+            # 按权重融合方向信息
+            y_scan.append(y_d * weights[i])
+
+        y = sum(y_scan) * self.act(z)
+        out = self.out_proj(y)
+        return out.transpose(1, 2).reshape(batch_size, self.d_model, H, W)
+
+
+class AGM_Module(nn.Module):
+    """
+    [新增模块] AGM (Anisotropic Gated Mamba)
+    采用四路并行且共享权重的各向异性扫描结构，降低参数量的同时强化方向感知。
+    """
+
+    def __init__(self, dim: int, d_state: int = 16, expand: int = 2, drop_path_rate: float = 0.0):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        # 共享同一个 AnisotropicGatedSASS 实例处理四分之一个通道
+        self.ss2d_core = AnisotropicGatedSASS(d_model=dim, d_state=d_state, expand=expand)
+        self.proj = nn.Conv2d(dim, dim, 1)
+
+        # 新增DropPath层
+        self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        identity = x
+
+        # 展平进行归一化
+        x_norm = self.norm(x.view(B, C, -1).transpose(1, 2)).transpose(1, 2).view(B, C, H, W)
+
+        # 通道拆分与并行处理
+        x_splits = torch.chunk(x_norm, 4, dim=1)
+        y_splits = [self.ss2d_core(split) for split in x_splits]
+        y = torch.cat(y_splits, dim=1)
+
+        # 将drop_path作用于分支
+        return self.drop_path(self.proj(y)) + identity
 
 
 # ============================================================================

@@ -139,6 +139,7 @@ class Crack500Dataset(BaseCrackDataset):
             mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
 
         _, mask = cv2.threshold(mask, 127, 1, cv2.THRESH_BINARY)
+        _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
         return mask
 
 

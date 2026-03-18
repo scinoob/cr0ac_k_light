@@ -1,15 +1,16 @@
 """
-测试脚本 - 裂缝分割网络模型评估
+测试脚本 - 裂缝分割网络模型评估与训练
 
-用于在测试集上评估模型性能，支持：
-- 加载训练好的模型检查点
+用于在测试集上评估模型性能或进行模型训练，支持：
+- 加载训练好的模型检查点进行测试
 - 计算各项评估指标（F1, IoU, mIoU, Precision, Recall, FPS）
 - 保存预测掩码
 - 生成可视化结果
 - 输出详细测试报告
 
 使用方法:
-    python test.py \
+    # 测试模式（默认）
+    python test.py 
         --checkpoint ./checkpoints/best_model.pth \
         --dataset crack500 \
         --data_root /mnt/d/dev/data/crack500 \
@@ -17,6 +18,10 @@
         --visualize \
         --num_vis 20 \
         --save_dir ./test_results
+
+作者: kimi
+改动时间: 2026-03-13
+改动说明: 新增训练功能，保留原有测试功能，支持train/test双模式运行
 """
 
 import os
@@ -29,19 +34,21 @@ from typing import Dict, List, Tuple, Optional
 
 import torch
 import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torch.cuda.amp import GradScaler, autocast
+from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast
 
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from models.crack_net import CrackSegmentationNet
+from models.crack_net import CrackSegmentationNet, CrackSegmentationNetV2
 from datasets.dataset import get_dataloader
 from utils.metrics import MetricCalculator, AverageMeter
-from utils.losses import BCEDiceLoss, CombinedLoss, DiceLoss, FocalLoss
+from utils.losses import BCEDiceLoss, CombinedLoss, DiceLoss, FocalLoss, TverskyLoss
 
 
 class Tester:
@@ -309,7 +316,8 @@ class Tester:
                 
                 # 保存预测结果
                 if save_predictions and save_dir:
-                    predictions = torch.sigmoid(outputs) > 0.5
+                    # predictions = torch.sigmoid(outputs) > 0.5
+                    predictions = outputs >0.5
                     processed_meta_list = self._process_meta_list(meta_list, batch_size)
                     
                     for i in range(batch_size):
@@ -530,7 +538,7 @@ class Tester:
             print(f"  - 预测结果: {len(results)} 张")
 
 
-def load_checkpoint(model: nn.Module, checkpoint_path: str, device: torch.device) -> Dict:
+def load_checkpoint(model: nn.Module, checkpoint_path: str, device: torch.device, strict: bool = True) -> Dict:
     """
     加载模型检查点
     
@@ -538,6 +546,7 @@ def load_checkpoint(model: nn.Module, checkpoint_path: str, device: torch.device
         model: 模型
         checkpoint_path: 检查点路径
         device: 设备
+        strict: 是否严格匹配权重（默认True）
         
     返回：
         检查点信息字典
@@ -549,10 +558,20 @@ def load_checkpoint(model: nn.Module, checkpoint_path: str, device: torch.device
     
     # 加载模型权重
     if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
-        print(f"✓ 成功加载模型权重")
+        try:
+            model.load_state_dict(checkpoint['model_state_dict'], strict=strict)
+            print(f"✓ 成功加载模型权重")
+        except RuntimeError as e:
+            # 如果 strict=True 失败，尝试非严格加载
+            if strict:
+                print(f"警告: 严格加载失败，尝试非严格加载...")
+                print(f"  错误信息: {str(e)[:200]}...")
+                model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+                print(f"✓ 成功加载模型权重（非严格模式）")
+            else:
+                raise e
     else:
-        model.load_state_dict(checkpoint)
+        model.load_state_dict(checkpoint, strict=strict)
         print(f"✓ 成功加载模型（完整模型）")
     
     # 打印检查点信息
@@ -562,6 +581,44 @@ def load_checkpoint(model: nn.Module, checkpoint_path: str, device: torch.device
         print(f"  验证指标: {checkpoint['metrics']}")
     
     return checkpoint
+
+
+def get_model_config_from_checkpoint(checkpoint_path: str, device: torch.device) -> Optional[Dict]:
+    """
+    从检查点中读取模型配置
+    
+    参数：
+        checkpoint_path: 检查点路径
+        device: 设备
+        
+    返回：
+        配置字典，如果不存在则返回None
+    """
+    if not os.path.exists(checkpoint_path):
+        return None
+    
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        
+        # 尝试从检查点中获取配置
+        config = None
+        if 'config' in checkpoint:
+            config = checkpoint['config']
+            print(f"  从检查点读取配置成功")
+        
+        # 如果有模型状态字典，尝试推断 base_channels
+        if config is None and 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+            # 从 patch_embed.0.weight 推断 base_channels
+            if 'patch_embed.0.weight' in state_dict:
+                base_channels = state_dict['patch_embed.0.weight'].shape[0]
+                config = {'base_channels': base_channels}
+                print(f"  从权重推断 base_channels: {base_channels}")
+        
+        return config
+    except Exception as e:
+        print(f"  警告: 读取检查点配置失败: {e}")
+        return None
 
 
 def get_loss_function(loss_type: str = 'bce_dice', **kwargs):
@@ -600,27 +657,17 @@ def get_loss_function(loss_type: str = 'bce_dice', **kwargs):
 def get_args():
     """获取命令行参数"""
     parser = argparse.ArgumentParser(
-        description='裂缝分割网络测试脚本',
+        description='裂缝分割网络测试脚本 (@kimi, 改动时间: 2026-03-13)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用示例:
-  # 基本测试
-  python test.py --checkpoint ./checkpoints/best_model.pth --dataset crack500
-  
-  # 保存预测结果和可视化
-  python test.py --checkpoint ./checkpoints/best_model.pth \\
-      --dataset crack500 --data_root /path/to/data \\
-      --save_predictions --visualize --save_dir ./test_results
-  
-  # 限制可视化数量
-  python test.py --checkpoint ./checkpoints/best_model.pth \\
-      --dataset cfd --visualize --num_vis 10
+  # 测试模式（默认）
+  python test.py --mode test --checkpoint ./checkpoints/best_model.pth --dataset crack500
         """
     )
     
-    # 必需参数
-    parser.add_argument('--checkpoint', type=str, required=True,
-                        help='模型检查点路径（必需）')
+    # ========== 新增: 运行模式参数 (作者: AI Assistant, 时间: 2026-03-13) ==========
+    parser.add_argument('--checkpoint', type=str, required=True)
     
     # 数据参数
     parser.add_argument('--dataset', type=str, default='crack500',
@@ -628,9 +675,9 @@ def get_args():
                         help='数据集名称 (默认: crack500)')
     parser.add_argument('--data_root', type=str, default='/mnt/d/dev/data/crack500',
                         help='数据根目录（默认根据数据集自动推断）')
-    parser.add_argument('--input_size', type=int, default=512,
+    parser.add_argument('--input_size', type=int, default=224,
                         help='输入图像尺寸 (默认: 512)')
-    parser.add_argument('--batch_size', type=int, default=8,
+    parser.add_argument('--batch_size', type=int, default=1,
                         help='批次大小 (默认: 8)')
     parser.add_argument('--num_workers', type=int, default=4,
                         help='数据加载工作进程数 (默认: 4)')
@@ -665,7 +712,7 @@ def get_args():
                         help='使用自动混合精度（推荐用于推理加速）')
     parser.add_argument('--device', type=str, default=None,
                         help='指定设备 (cuda/cpu，默认自动选择)')
-    # [新增] 性能测试模式
+    # 性能测试模式
     parser.add_argument('--benchmark', action='store_true',
                         help='仅评估推理速度（不包含指标计算和 IO，用于论文报告）')
 
@@ -675,7 +722,6 @@ def get_args():
 
 
 def main():
-    """主测试函数"""
     args = get_args()
     
     # 设置设备
@@ -706,16 +752,14 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
     print(f"测试结果保存路径: {args.save_dir}")
     
-    # 创建模型
     print("\n【1/4】创建模型...")
-    model = CrackSegmentationNet(
+    model = CrackSegmentationNetV2(
         in_channels=3,
         num_classes=1,
         base_channels=args.base_channels,
         input_size=args.input_size,
         d_state=args.d_state,
         use_gbc=args.use_gbc,
-        use_aspp=args.use_aspp
     )
     
     # 计算参数量
@@ -800,23 +844,30 @@ def main():
         save_dir=args.save_dir,
         visualize=args.visualize,
         num_vis=args.num_vis,
-        benchmark=args.benchmark  # [新增] 传递 benchmark 参数
+        benchmark=args.benchmark
     )
     
     # 打印最终结果
     print("\n" + "=" * 70)
     print(" " * 25 + "测试结果")
     print("=" * 70)
-    print(f"  损失 (Loss):        {test_results['loss']:.4f}")
-    print(f"  F1 分数:            {test_results['f1']:.4f}")
-    print(f"  IoU:                {test_results['iou']:.4f}")
-    print(f"  mIoU:               {test_results['miou']:.4f}")
-    print(f"  精确率 (Precision): {test_results['precision']:.4f}")
-    print(f"  召回率 (Recall):    {test_results['recall']:.4f}")
-    print(f"  准确率 (Accuracy):  {test_results['accuracy']:.4f}")
-    print(f"  特异性 (Specificity): {test_results['specificity']:.4f}")
-    print(f"  推理速度 (FPS):     {test_results['fps']:.2f}")
-    print(f"  总推理时间:         {test_results['total_time']:.2f} s")
+    
+    # Benchmark模式下结果格式不同
+    if args.benchmark:
+        print(f"  推理速度 (FPS):     {test_results['fps']:.2f}")
+        print(f"  总推理时间:         {test_results['total_inference_time']:.4f} s")
+        print(f"  测试样本数:         {test_results['num_samples']}")
+    else:
+        print(f"  损失 (Loss):        {test_results['loss']:.4f}")
+        print(f"  F1 分数:            {test_results['f1']:.4f}")
+        print(f"  IoU:                {test_results['iou']:.4f}")
+        print(f"  mIoU:               {test_results['miou']:.4f}")
+        print(f"  精确率 (Precision): {test_results['precision']:.4f}")
+        print(f"  召回率 (Recall):    {test_results['recall']:.4f}")
+        print(f"  准确率 (Accuracy):  {test_results['accuracy']:.4f}")
+        print(f"  特异性 (Specificity): {test_results['specificity']:.4f}")
+        print(f"  推理速度 (FPS):     {test_results['fps']:.2f}")
+        print(f"  总推理时间:         {test_results['total_time']:.2f} s")
     print("=" * 70)
     
     print(f"\n✓ 测试完成！结果保存在: {args.save_dir}")

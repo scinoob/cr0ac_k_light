@@ -6,9 +6,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from typing import Tuple, Optional, List, Dict
 
-from modules.base_modules import PConv, PConvBlock, UpSample, ConvBNReLU
+from modules.base_modules import DepthwiseSeparableConv, PConv, PConvBlock, UpSample, ConvBNReLU, GBC
 from modules.dual_branch import DualBranchModuleA
 
 
@@ -651,6 +652,105 @@ class CrackSegmentationNet(nn.Module):
         f3 = self.encoder3(f2)
         f4 = self.encoder4(f3)
         return [f1, f2, f3, f4]
+
+
+# edited by gemini
+# --- 在 models/crack_net.py 中添加 ---
+from modules.SS2D_quard_parallel import AGM_Module  # 确保导入新定义的 AGM
+
+
+class AGM_LightFusion(nn.Module):
+    """
+    [配套模块] 极简融合块
+    替代原有的 LightFusionBlock，专注于低参数量的跳跃连接合并。
+    """
+
+    def __init__(self, in_channels, out_channels, use_gbc: bool = True):
+        super().__init__()
+
+        self.reduce = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+        # 【关键手术 2】解码器细化：开启 GBC 时使用 GBC 提纯，否则用 PConv
+        self.refine = GBC(out_channels) if use_gbc else PConvBlock(out_channels)
+
+    def forward(self, x_up, x_skip):
+        # return self.fuse(torch.cat([x_up, x_skip], dim=1))
+        x = torch.cat([x_up, x_skip], dim=1)
+        x = self.reduce(x)
+        return self.refine(x)
+
+
+class CrackSegmentationNetV2(nn.Module):
+    """
+        [新增网络] 裂缝分割网络 V2
+        特点：
+        1. 非对称设计：浅层(Stage 1-2)纯 CNN，深层(Stage 3-4) AGM Mamba。
+        2. 无 ASPP：减少计算开销，通过 AGM 捕获长程依赖。
+        3. 各向异性权重：强化细长裂缝的连通性。
+    """
+
+    def __init__(self, in_channels=3, num_classes=1, base_channels=96, input_size=224, use_gbc=True,
+                 drop_path_rate: float = 0.0, **kwargs):
+        super().__init__()
+
+        chs = [base_channels, base_channels * 2, base_channels * 4, base_channels * 8]
+
+        # 计算各阶段的 drop_path 概率（线性调度，随深度增加）
+        dpr = np.linspace(0, drop_path_rate, 4).tolist()
+
+        self.patch_embed = nn.Sequential(
+            nn.Conv2d(in_channels, chs[0], 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(chs[0]),
+            nn.ReLU(inplace=True)
+        )
+
+        # 【关键手术 3】浅层编码器注入 GBC
+        # 在高分辨率下，GBC 能有效剥离水渍和阴影，为主干减负
+        self.stage1_gbc = GBC(chs[0]) if use_gbc else nn.Identity()
+        self.stage1 = PConvBlock(chs[0], drop_path_rate=dpr[0])
+        self.down1 = DepthwiseSeparableConv(chs[0], chs[1], stride=2)
+
+        self.stage2_gbc = GBC(chs[1]) if use_gbc else nn.Identity()
+        self.stage2 = PConvBlock(chs[1], drop_path_rate=dpr[1])
+        self.down2 = DepthwiseSeparableConv(chs[1], chs[2], stride=2)
+
+        # 深层保持 AGM Mamba，提取拓扑连通性
+        self.stage3 = AGM_Module(chs[2], drop_path_rate=dpr[2])
+        self.down3 = DepthwiseSeparableConv(chs[2], chs[3], stride=2)
+        self.stage4 = AGM_Module(chs[3], drop_path_rate=dpr[3])
+
+        # 解码器：传入 use_gbc 进行高保真重建
+        self.up4 = UpSample(2)
+        self.fuse3 = AGM_LightFusion(chs[3] + chs[2], chs[2], use_gbc)
+        self.up3 = UpSample(2)
+        self.fuse2 = AGM_LightFusion(chs[2] + chs[1], chs[1], use_gbc)
+        self.up2 = UpSample(2)
+        self.fuse1 = AGM_LightFusion(chs[1] + chs[0], chs[0], use_gbc)
+        self.up1 = UpSample(2)
+
+        self.seg_head = nn.Sequential(
+            nn.Conv2d(chs[0], num_classes, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        p = self.patch_embed(x)
+
+        f1 = self.stage1(self.stage1_gbc(p))
+        f2 = self.stage2(self.stage2_gbc(self.down1(f1)))
+        f3 = self.stage3(self.down2(f2))
+        f4 = self.stage4(self.down3(f3))
+
+        x = self.fuse3(self.up4(f4), f3)
+        x = self.fuse2(self.up3(x), f2)
+        x = self.fuse1(self.up2(x), f1)
+        x = self.up1(x)
+
+        return self.seg_head(x)
 
 
 # ==================== 测试代码 ====================

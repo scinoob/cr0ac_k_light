@@ -9,7 +9,6 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sympy.physics.vector import gradient
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
@@ -24,7 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from utils.metrics import MetricCalculator, AverageMeter
 from utils.losses import CombinedLoss, DiceLoss, FocalLoss, BCEDiceLoss, TverskyLoss
-from models.crack_net import CrackSegmentationNet
+from models.crack_net import CrackSegmentationNet, CrackSegmentationNetV2
 from datasets.dataset import get_dataloader
 
 
@@ -926,16 +925,25 @@ def main():
         print(f"    Stage {i + 1}: dim={ch}, heads={heads}, head_dim={head_dim}")
 
     # @kimi 修改: 添加drop_path_rate参数和num_heads_list
-    model = CrackSegmentationNet(
+    # model = CrackSegmentationNet(
+    #     in_channels=3,
+    #     num_classes=1,
+    #     base_channels=args.base_channels,
+    #     input_size=args.input_size,
+    #     d_state=args.d_state,
+    #     use_gbc=args.use_gbc,
+    #     use_aspp=args.use_aspp,
+    #     drop_path_rate=args.drop_path_rate,  # @kimi 新增: 传递drop_path_rate参数
+    #     num_heads_list=num_heads_list  # @kimi 新增: 传递自适应num_heads_list
+    # )
+    model = CrackSegmentationNetV2(
         in_channels=3,
         num_classes=1,
         base_channels=args.base_channels,
         input_size=args.input_size,
         d_state=args.d_state,
         use_gbc=args.use_gbc,
-        use_aspp=args.use_aspp,
         drop_path_rate=args.drop_path_rate,  # @kimi 新增: 传递drop_path_rate参数
-        num_heads_list=num_heads_list  # @kimi 新增: 传递自适应num_heads_list
     )
 
     # 计算参数量
