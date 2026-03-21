@@ -22,7 +22,7 @@ from datetime import datetime
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from utils.metrics import MetricCalculator, AverageMeter
+from utils.metrics import MetricCalculator, AverageMeter, RigorousCalculator
 from utils.losses import CombinedLoss, DiceLoss, FocalLoss, BCEDiceLoss, TverskyLoss
 from models.crack_net import CrackSegmentationNet, CrackSegmentationNetV2
 from datasets.dataset import get_dataloader
@@ -90,7 +90,8 @@ class Trainer:
         # 指标
         self.train_loss_meter = AverageMeter()
         self.val_loss_meter = AverageMeter()
-        self.metric_calc = MetricCalculator()
+        # self.metric_calc = MetricCalculator()
+        self.metric_calc = RigorousCalculator()
 
         # 最佳模型
         self.best_f1 = 0.0
@@ -161,7 +162,7 @@ class Trainer:
 
                 total_norm = self.get_gradient_norm(self.model)
                 self.writer.add_scalar('train/Gradient', total_norm, epoch)
-                print(f"Gradient norm: {total_norm:.4f}", end="\r")
+                # print(f"Gradient norm: {total_norm:.4f}", end="\r")
 
                 # 梯度裁剪
                 if self.grad_clip is not None and self.grad_clip > 0:
@@ -170,7 +171,7 @@ class Trainer:
                     # 打印梯度裁剪后的梯度范数
                     total_norm = self.get_gradient_norm(self.model)
                     self.writer.add_scalar('train/Gradient_norm_after_clip', total_norm, epoch)
-                    print(f"Gradient norm after clip: {total_norm:.4f}", end="\r")
+                    # print(f"Gradient norm after clip: {total_norm:.4f}", end="\r")
 
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
@@ -181,7 +182,7 @@ class Trainer:
 
                 total_norm = self.get_gradient_norm(self.model)
                 self.writer.add_scalar('train/Gradient', total_norm, epoch)
-                print(f"Gradient norm: {total_norm:.4f}", end="\r")
+                # print(f"Gradient norm: {total_norm:.4f}", end="\r")
 
                 # 梯度裁剪
                 if self.grad_clip is not None and self.grad_clip > 0:
@@ -189,7 +190,7 @@ class Trainer:
                     # 打印梯度裁剪后的梯度范数
                     total_norm = self.get_gradient_norm(self.model)
                     self.writer.add_scalar('train/Gradient_norm_after_clip', total_norm, epoch)
-                    print(f"Gradient norm after clip: {total_norm:.4f}", end="\r")
+                    # print(f"Gradient norm after clip: {total_norm:.4f}", end="\r")
 
                 self.optimizer.step()
 
@@ -211,7 +212,8 @@ class Trainer:
                     mask = masks[target_idx]  # (1, H, W)
 
                     # 处理预测值：转换为二值可视化格式
-                    pred = pred.cpu().numpy() * 255
+                    # 【修复代码】将预测值转换为概率，再映射到 0-255
+                    pred = torch.sigmoid(pred).cpu().numpy() * 255
                     _, pred = cv2.threshold(pred, 127, 255, cv2.THRESH_BINARY)
                     _, pred = cv2.threshold(pred, 127, 1, cv2.THRESH_BINARY)
 
@@ -267,13 +269,14 @@ class Trainer:
 
             # 更新指标
             self.val_loss_meter.update(loss.item(), images.size(0))
-            self.metric_calc.update(outputs, masks)
+            # 【修复代码】计算指标前，必须将 Logits 转换为概率！
+            self.metric_calc.update(torch.sigmoid(outputs), masks)
 
         # 计算指标
         metrics = self.metric_calc.compute()
         miou = self.metric_calc.compute_mIoU()
 
-        return {
+        result =  {
             'loss': self.val_loss_meter.avg,
             'f1': metrics['f1'],
             'precision': metrics['precision'],
@@ -281,6 +284,12 @@ class Trainer:
             'iou': metrics['iou'],
             'miou': miou
         }
+
+        # 【关键修复】将丢掉的新指标强行补回来！
+        result['ois_f1'] = metrics.get('ois_f1', 0.0)
+        result['best_threshold'] = metrics.get('best_threshold', 0.5)
+
+        return result
 
     @torch.no_grad()
     def test(
@@ -563,7 +572,14 @@ class Trainer:
             # 验证
             val_metrics = self.validate(epoch)
             print(f"  验证损失: {val_metrics['loss']:.4f}")
-            print(f"  F1: {val_metrics['f1']:.4f}, IoU: {val_metrics['iou']:.4f}, mIoU: {val_metrics['miou']:.4f}")
+            # print(f"  F1: {val_metrics['f1']:.4f}, IoU: {val_metrics['iou']:.4f}, mIoU: {val_metrics['miou']:.4f}")
+            # print(f"  Precision: {val_metrics['precision']:.4f}, Recall: {val_metrics['recall']:.4f}")
+            # 【新日志格式】：直接展示 ODS, OIS 以及搜出来的最适阈值
+            # 【修改点】：打印 ODS F1, OIS F1, 和最佳阈值
+            print(
+                f"  ODS F1: {val_metrics['f1']:.4f}, OIS F1: {val_metrics.get('ois_f1', 0):.4f}, "
+                f"最优阈值: {val_metrics.get('best_threshold', 0.5):.2f}")
+            print(f"  IoU: {val_metrics['iou']:.4f}, mIoU: {val_metrics['miou']:.4f}")
             print(f"  Precision: {val_metrics['precision']:.4f}, Recall: {val_metrics['recall']:.4f}")
 
             # 记录历史
@@ -586,8 +602,8 @@ class Trainer:
             self.writer.add_scalar('Metrics/miou', val_metrics['miou'], epoch)
             self.writer.add_scalar('Learning_rate', self.optimizer.param_groups[0]['lr'], epoch)
 
-            # 保存最佳模型
-            if val_metrics['f1'] > self.best_f1:
+            # 保存最佳模型，除非f1>0.55，节省空间
+            if val_metrics['f1'] > self.best_f1 and val_metrics['f1'] > 0.55:
                 self.best_f1 = val_metrics['f1']
                 self.best_epoch = epoch
                 self.save_checkpoint(epoch, val_metrics, is_best=True)
@@ -771,7 +787,7 @@ def get_args():
                         help='基础通道数')
     parser.add_argument('--d_state', type=int, default=16,
                         help='Mamba状态维度')
-    parser.add_argument('--use_gbc', action='store_true',
+    parser.add_argument('--use_gbc', default=True,
                         help='使用GBC模块')
     parser.add_argument('--use_aspp', action='store_true',
                         help='使用ASPP模块')

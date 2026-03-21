@@ -94,7 +94,7 @@ def main():
     parser = argparse.ArgumentParser(description="CrackSegmentationNetV2 逐层注意力可视化")
     parser.add_argument('--checkpoint', type=str, required=True, help='模型权重路径 (.pth)')
     parser.add_argument('--image_path', type=str, required=True, help='测试图像路径')
-    parser.add_argument('--input_size', type=int, default=512, help='输入尺寸')
+    parser.add_argument('--input_size', type=int, default=224, help='输入尺寸')
     parser.add_argument('--save_dir', type=str, default='./cam_analysis', help='保存目录')
     args = parser.parse_args()
 

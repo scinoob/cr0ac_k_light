@@ -204,12 +204,16 @@ class PConvBlock(nn.Module):
             expand_ratio: float = 2.0,
             partial_ratio: float = 0.25,
             drop_path_rate: float = 0.0,
+            kernel_size: int = 3,
     ):
         super().__init__()
 
         mid_channels = int(in_channels * expand_ratio)
 
-        self.pconv = PConv(in_channels, in_channels, partial_ratio)
+        # 【新增】自动计算 padding，保证特征图尺寸不变 (7x7 对应 padding=3)
+        pad = (kernel_size - 1) // 2
+
+        self.pconv = PConv(in_channels, in_channels, partial_ratio, kernel_size=kernel_size,  padding=pad)
         self.pwconv1 = PWConv(in_channels, mid_channels)
         self.pwconv2 = PWConv(mid_channels, in_channels)
         self.act = nn.GELU()

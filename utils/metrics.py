@@ -7,6 +7,135 @@ import torch
 from typing import Dict, List, Tuple, Optional
 
 
+class RigorousCalculator:
+    """
+    裂缝分割指标计算器 (支持 ODS, OIS 全自动阈值搜索)
+
+    采用 GPU 极速并行计算，瞬间遍历 0.01~0.99 的 99 个阈值。
+    无需等待，每个 Epoch 实时输出最佳阈值。
+    """
+
+    def __init__(self, threshold: float = 0.5):
+        # 参数 threshold 仅为兼容老代码保留，实际将被动态阈值取代
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # 生成 0.01 到 0.99 的 99 个阈值
+        self.thresholds = torch.linspace(0.01, 0.99, 99, device=self.device)
+        self.num_th = len(self.thresholds)
+        self.reset()
+
+    def reset(self):
+        """重置所有阈值下的计数器"""
+        # 为 99 个阈值分别记录 TP, FP, FN, TN
+        self.tp = torch.zeros(self.num_th, device=self.device)
+        self.fp = torch.zeros(self.num_th, device=self.device)
+        self.fn = torch.zeros(self.num_th, device=self.device)
+        self.tn = torch.zeros(self.num_th, device=self.device)
+
+        # 用于 OIS 统计
+        self.ois_f1_sum = 0.0
+        self.img_count = 0
+
+    def update(
+            self,
+            pred: torch.Tensor,
+            target: torch.Tensor
+    ) -> Dict[str, float]:
+        """更新 99 个阈值下的计数器"""
+        if pred.dim() == 4:
+            pred = pred.squeeze(1)
+        if target.dim() == 4:
+            target = target.squeeze(1)
+
+        B = pred.shape[0]
+
+        # 展平图像以加速运算，形如 (B, N)
+        pred = pred.view(B, -1)
+        target = target.view(B, -1).bool()  # 使用 bool 加速逻辑运算
+
+        f1_table = []
+
+        # 遍历 99 个阈值。在 GPU 上做此级联位运算耗时极短，且不占用额外显存
+        for i, th in enumerate(self.thresholds):
+            p_bin = pred > th
+
+            # 按样本(dim=1)分别计算 TP, FP, FN, TN，以便给 OIS 使用
+            tp = (p_bin & target).sum(dim=1)
+            fp = (p_bin & ~target).sum(dim=1)
+            fn = (~p_bin & target).sum(dim=1)
+            tn = (~p_bin & ~target).sum(dim=1)
+
+            # 累加到全局 (用于 ODS)
+            self.tp[i] += tp.sum()
+            self.fp[i] += fp.sum()
+            self.fn[i] += fn.sum()
+            self.tn[i] += tn.sum()
+
+            # 计算此阈值下的逐图片 F1 (用于 OIS)
+            eps = 1e-6
+            prec = tp.float() / (tp + fp + eps)
+            rec = tp.float() / (tp + fn + eps)
+            f1 = 2 * prec * rec / (prec + rec + eps)
+            f1_table.append(f1.unsqueeze(1))  # (B, 1)
+
+        # 统计 OIS (每张图在 99 个结果中挑一个最大的 F1)
+        f1_table = torch.cat(f1_table, dim=1)  # (B, 99)
+        best_f1, _ = f1_table.max(dim=1)
+        self.ois_f1_sum += best_f1.sum().item()
+        self.img_count += B
+
+        return {'f1': 0.0}  # 批量更新时不返回实际值，以最后 compute() 为准
+
+    def compute(self) -> Dict[str, float]:
+        """计算最终的最佳指标"""
+        eps = 1e-6
+        # 计算 99 个阈值下的全局指标
+        prec = self.tp / (self.tp + self.fp + eps)
+        rec = self.tp / (self.tp + self.fn + eps)
+        f1 = 2 * prec * rec / (prec + rec + eps)
+        iou = self.tp / (self.tp + self.fp + self.fn + eps)
+
+        # --- ODS F1 寻优 ---
+        best_idx = torch.argmax(f1)
+        ods_f1 = f1[best_idx].item()
+        ods_prec = prec[best_idx].item()
+        ods_rec = rec[best_idx].item()
+        ods_iou = iou[best_idx].item()
+        best_th = self.thresholds[best_idx].item()
+
+        # --- OIS F1 ---
+        ois_f1 = self.ois_f1_sum / max(self.img_count, 1)
+
+        # 强制将 ODS F1 映射到 'f1' 键值，这样 train.py 就会自动拿 ODS 指标去保存最佳模型！
+        return {
+            'f1': ods_f1,
+            'precision': ods_prec,
+            'recall': ods_rec,
+            'iou': ods_iou,
+            'ods_f1': ods_f1,
+            'ois_f1': ois_f1,
+            'best_threshold': best_th,
+        }
+
+    def compute_mIoU(self) -> float:
+        """根据寻优得到的最佳阈值计算 mIoU"""
+        eps = 1e-6
+        prec = self.tp / (self.tp + self.fp + eps)
+        rec = self.tp / (self.tp + self.fn + eps)
+        f1 = 2 * prec * rec / (prec + rec + eps)
+
+        best_idx = torch.argmax(f1)  # 找到使得全局 F1 最大的阈值索引
+
+        tp = self.tp[best_idx].item()
+        fp = self.fp[best_idx].item()
+        fn = self.fn[best_idx].item()
+        tn = self.tn[best_idx].item()
+
+        iou_fg = tp / (tp + fp + fn + eps)
+        iou_bg = tn / (tn + fn + fp + eps)
+
+        return (iou_fg + iou_bg) / 2
+
+
 class MetricCalculator:
     """
     分割指标计算器

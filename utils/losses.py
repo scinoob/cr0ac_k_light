@@ -103,6 +103,7 @@ class FocalLoss(nn.Module):
         self.alpha = alpha
         self.gamma = gamma
         self.reduction = reduction
+        self.bce = nn.BCELoss()
         self.apply_sigmoid = apply_sigmoid
 
     def forward(
@@ -132,10 +133,12 @@ class FocalLoss(nn.Module):
 
         # 避免数值问题
         eps = 1e-7
-        pred = torch.clamp(pred, eps, 1 - eps)
+        pred = torch.clamp(pred, eps, 1 - eps).float()
+        target = target.float()
 
         # 计算交叉熵
-        bce = -target * torch.log(pred) - (1 - target) * torch.log(1 - pred)
+        # bce = -target * torch.log(pred) - (1 - target) * torch.log(1 - pred)
+        bce = self.bce(pred, target)
 
         # 计算p_t
         p_t = pred * target + (1 - pred) * (1 - target)
@@ -176,7 +179,7 @@ class BCEDiceLoss(nn.Module):
         self.bce_weight = bce_weight
         self.dice_weight = dice_weight
         self.bce = nn.BCEWithLogitsLoss()  # 使用BCEWithLogitsLoss，内部会应用sigmoid
-        self.dice = DiceLoss(apply_sigmoid=False)  # 已经在外面应用了sigmoid
+        self.dice = DiceLoss(apply_sigmoid=True)
 
     def forward(
             self,

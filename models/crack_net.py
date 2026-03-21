@@ -20,7 +20,7 @@ class AttentionGate(nn.Module):
     """
 
     def __init__(self, F_g, F_l, F_int):
-        super(AttentionGate, self).__init__()
+        super().__init__()
         self.W_g = nn.Sequential(
             nn.Conv2d(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=True),
             nn.BatchNorm2d(F_int)
@@ -690,12 +690,14 @@ class CrackSegmentationNet(nn.Module):
 # --- 在 models/crack_net.py 中添加 ---
 from modules.SS2D_quard_parallel import AGM_Module  # 确保导入新定义的 AGM
 
+
 class MaxPoolDown(nn.Module):
     """
     基于最大池化的下采样模块
     利用 MaxPool 保留区域内的最大激活值（微弱裂缝的峰值特征），
     防止微小目标在跨步卷积（stride=2）中被背景平滑掉导致特征消失。
     """
+
     def __init__(self, in_channels, out_channels):
         super().__init__()
         # 1. 使用 MaxPool 进行严格的空间下采样，保留最强信号
@@ -710,18 +712,32 @@ class MaxPoolDown(nn.Module):
     def forward(self, x):
         return self.conv(self.pool(x))
 
+
 class AGM_LightFusion(nn.Module):
     """
     [配套模块] 极简融合块
     替代原有的 LightFusionBlock，专注于低参数量的跳跃连接合并。
+
+    [通道对等升级版] 极简融合块
+    在融合前，强制将深层上采样的通道压缩到与浅层特征同等维度，
+    消除深层特征的“通道数量霸权”，强迫 CNN 与 Mamba 平等协作
     """
 
     def __init__(self, up_channels, skip_channels, out_channels, use_gbc: bool = True):
         super().__init__()
-        # 引入注意力门控，中间通道数设为浅层通道数的一半，极大地控制参数量
-        self.ag = AttentionGate(F_g=up_channels, F_l=skip_channels, F_int=skip_channels // 2)
 
-        in_channels = skip_channels + up_channels
+        # 【新增：通道对齐层】
+        # 强制将庞大的深层通道 (up_channels) 压缩到浅层维度 (skip_channels)
+        self.align_up = nn.Sequential(
+            nn.Conv2d(up_channels, skip_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(skip_channels),
+            nn.ReLU(inplace=True)
+        )
+
+        # 引入注意力门控，中间通道数设为浅层通道数的一半，极大地控制参数量
+        self.ag = AttentionGate(F_g=skip_channels, F_l=skip_channels, F_int=skip_channels // 2)
+
+        in_channels = skip_channels * 2
 
         self.reduce = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 1, bias=False),
@@ -733,12 +749,17 @@ class AGM_LightFusion(nn.Module):
         self.refine = GBC(out_channels) if use_gbc else PConvBlock(out_channels)
 
     def forward(self, x_up, x_skip):
+        # 1. 首先剥夺深层特征的通道优势，进行降维对齐
+        x_up_aligned = self.align_up(x_up)
+
         # 1. 用深层特征 x_up 过滤浅层特征 x_skip
-        x_skip_ag = self.ag(g=x_up, x=x_skip)
+        # 2. 用对齐后的深层特征 x_up_aligned 去引导过滤浅层特征 x_skip
+        x_skip_ag = self.ag(g=x_up_aligned, x=x_skip)
         # return self.fuse(torch.cat([x_up, x_skip], dim=1))
 
         # 2. 拼接过滤后的特征与深沉特征
-        x = torch.cat([x_up, x_skip_ag], dim=1)
+        # 3. 拼接两个地位平等的特征 (维度均为 skip_channels)
+        x = torch.cat([x_up_aligned, x_skip_ag], dim=1)
 
         # 3. 降维并细化
         x = self.reduce(x)
@@ -772,13 +793,15 @@ class CrackSegmentationNetV2(nn.Module):
         # 【关键手术 3】浅层编码器注入 GBC
         # 在高分辨率下，GBC 能有效剥离水渍和阴影，为主干减负
         self.stage1_gbc = GBC(chs[0]) if use_gbc else nn.Identity()
-        self.stage1 = PConvBlock(chs[0], drop_path_rate=dpr[0])
+        # 【修改】将 Stage 1的卷积核放大到 7 * 7
+        self.stage1 = PConvBlock(chs[0], drop_path_rate=dpr[0], kernel_size=7)
         # self.down1 = DepthwiseSeparableConv(chs[0], chs[1], stride=2)
         # 替换为池化提取特征
         self.down1 = MaxPoolDown(chs[0], chs[1])
 
         self.stage2_gbc = GBC(chs[1]) if use_gbc else nn.Identity()
-        self.stage2 = PConvBlock(chs[1], drop_path_rate=dpr[1])
+        # 【修改】将 Stage 2的卷积核放大到 7 * 7
+        self.stage2 = PConvBlock(chs[1], drop_path_rate=dpr[1], kernel_size=7)
         # self.down2 = DepthwiseSeparableConv(chs[1], chs[2], stride=2)
         self.down2 = MaxPoolDown(chs[1], chs[2])
 
@@ -807,7 +830,9 @@ class CrackSegmentationNetV2(nn.Module):
 
         self.seg_head = nn.Sequential(
             nn.Conv2d(chs[0], num_classes, 1),
-            nn.Sigmoid()
+            # 业界标准做法是：模型输出 Logits，由 Loss 内部去算 Sigmoid，
+            # 在计算评估指标（Metrics）时由人为套上 Sigmoid。
+            # nn.Sigmoid()
         )
 
     def forward(self, x):
@@ -823,98 +848,10 @@ class CrackSegmentationNetV2(nn.Module):
         x = self.fuse1(self.up2(x), f1)
         x = self.up1(x)
 
+        # 关于 self.training：它是 PyTorch nn.Module 的内置属性。
+        # 当您在 train.py 中调用 self.model.train() 时，PyTorch 会自动将模型及其所有子模块的
+        # self.training 设为 True；当调用 self.model.eval() 时
+        # （如在 validate 和 test 函数中），它会被自动设为 False。
+        # 因此，即使没有显式传参，网络也是能自己区分训练和推理状态的。
+
         return self.seg_head(x)
-
-
-# ==================== 测试代码 ====================
-if __name__ == "__main__":
-    print("=" * 60)
-    print("测试解码器和完整网络模型")
-    print("=" * 60)
-
-    # 测试参数
-    batch_size = 2
-    input_size = 512
-
-    # 测试LightFusionBlock
-    print("\n[1] 测试LightFusionBlock...")
-    fusion = LightFusionBlock(in_channels=128, out_channels=64)
-    x_up = torch.randn(batch_size, 64, 32, 32)
-    x_skip = torch.randn(batch_size, 64, 32, 32)
-    out = fusion(x_up, x_skip)
-    print(f"  上采样特征: {x_up.shape}")
-    print(f"  跳跃连接特征: {x_skip.shape}")
-    print(f"  融合输出: {out.shape}")
-    print(f"  参数量: {sum(p.numel() for p in fusion.parameters()):,}")
-
-    # 测试DecoderStage
-    print("\n[2] 测试DecoderStage...")
-    decoder_stage = DecoderStage(in_channels=256, skip_channels=128, out_channels=128)
-    x = torch.randn(batch_size, 256, 16, 16)
-    skip = torch.randn(batch_size, 128, 32, 32)
-    out = decoder_stage(x, skip)
-    print(f"  输入特征: {x.shape}")
-    print(f"  跳跃连接: {skip.shape}")
-    print(f"  输出特征: {out.shape}")
-
-    # 测试ASPP
-    print("\n[3] 测试ASPP...")
-    aspp = ASPP(256, 256)
-    x = torch.randn(batch_size, 256, 32, 32)
-    out = aspp(x)
-    print(f"  输入形状: {x.shape}")
-    print(f"  输出形状: {out.shape}")
-    print(f"  参数量: {sum(p.numel() for p in aspp.parameters()):,}")
-
-    # 测试完整网络
-    print("\n[4] 测试CrackSegmentationNet...")
-    model = CrackSegmentationNet(
-        in_channels=3,
-        num_classes=1,
-        base_channels=32,
-        input_size=input_size
-    )
-
-    # 输入图像
-    x = torch.randn(batch_size, 3, input_size, input_size)
-
-    # 前向传播
-    out = model(x)
-    print(f"  输入图像: {x.shape}")
-    print(f"  分割输出: {out.shape}")
-
-    # 计算参数量
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  总参数量: {total_params:,}")
-    print(f"  可训练参数量: {trainable_params:,}")
-
-    # 测试返回中间特征
-    print("\n[5] 测试返回中间特征...")
-    out, features = model(x, return_features=True)
-    print(f"  分割输出: {out.shape}")
-    print("  中间特征:")
-    for name, feat in features.items():
-        print(f"    {name}: {feat.shape}")
-
-    # 测试梯度
-    print("\n[6] 测试梯度反向传播...")
-    loss = out.sum()
-    loss.backward()
-    print("  梯度计算成功")
-
-    # 测试不同输入尺寸
-    print("\n[7] 测试不同输入尺寸...")
-    for size in [256, 384]:
-        model_test = CrackSegmentationNet(
-            in_channels=3,
-            base_channels=32,
-            input_size=size
-        )
-        x_test = torch.randn(1, 3, size, size)
-        out = model_test(x_test)
-        print(f"  输入 {size}x{size} -> 输出 {out.shape}")
-
-    print("\n" + "=" * 60)
-    print("所有解码器和网络模型测试通过！")
-    print("=" * 60)

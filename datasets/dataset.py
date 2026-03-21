@@ -86,7 +86,7 @@ class BaseCrackDataset(Dataset):
 
     def _read_mask(self, idx: int) -> np.ndarray:
         """读取掩码，子类可重写"""
-        mask = cv2.imread(self.masks[idx], cv2.IMREAD_GRAYSCALE)
+        mask = cv2.imread(self.masks[idx], cv2.COLOR_BGR2GRAY)
         _, mask = cv2.threshold(mask, 127, 1, cv2.THRESH_BINARY)
         return mask
 
@@ -139,7 +139,7 @@ class Crack500Dataset(BaseCrackDataset):
             mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
 
         _, mask = cv2.threshold(mask, 127, 1, cv2.THRESH_BINARY)
-        _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+        # _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
         return mask
 
 

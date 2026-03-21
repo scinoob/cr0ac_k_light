@@ -13,6 +13,8 @@ test_results_benchmark/
 wdecay001spaAtt/
 gradcam_outputs/
 test_results_gemini0314/
+cam_analysis/
+test_result_crack500/
 
 log/
 
