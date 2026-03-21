@@ -238,7 +238,7 @@ def main():
         dataset_name=args.dataset,
         root_dir=args.data_root,
         split='test',
-        batch_size=4,            # <--- 强制设置为 1
+        batch_size=1,            # <--- 强制设置为 1
         target_size=args.input_size,
         num_workers=4
     )
